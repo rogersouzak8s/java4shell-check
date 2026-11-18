@@ -41,7 +41,7 @@ Requirements: `bash` on your machine (3.2+, macOS works), `docker` or `kubectl` 
 ### Example output
 
 ```
-── k8s:identity/keycloak-568c44d9b7-4dkp6
+── k8s:identity/keycloak-7d9f8c6b5-x2k4p
    node:             aks-nodepool1-0000000-vmss000001
    application:      Keycloak
    JDK:              21.0.12.1+1-LTS (Red Hat, Inc.)
