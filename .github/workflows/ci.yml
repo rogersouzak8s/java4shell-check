@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (warnings and errors)
+        run: shellcheck -S warning -x check-java4shell.sh test-unit.sh test-integration.sh
+
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bash: bash        # bash 5
+          - os: macos-latest
+            bash: /bin/bash   # bash 3.2, the one macOS ships
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: ${{ matrix.bash }} --version | head -1
+      - run: ${{ matrix.bash }} ./test-unit.sh
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: runner CPU
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          if grep -qw avx512vbmi /proc/cpuinfo; then echo "avx512vbmi: yes (EXPOSED path runs on real hardware)"; else echo "avx512vbmi: no"; fi
+      - run: ./test-integration.sh

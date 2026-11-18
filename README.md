@@ -1,5 +1,7 @@
 # java4shell-check
 
+[![ci](https://github.com/rogersouzak8s/java4shell-check/actions/workflows/ci.yml/badge.svg)](https://github.com/rogersouzak8s/java4shell-check/actions/workflows/ci.yml)
+
 Read-only checker for **CVE-2026-114938 ("Java4Shell")**, the out-of-bounds heap write in HotSpot's AVX-512 Base64 decode intrinsic. It tells you whether a running Keycloak, or any other Java service, is actually exposed, by asking the JVM itself.
 
 It sends nothing to your application. No malformed Base64, no exploit, nothing that could crash the JVM.
@@ -18,14 +20,21 @@ The script checks 1 to 3 on the real running process. Condition 4 depends on the
 ## Usage
 
 ```bash
-./check-java4shell.sh docker <container> [<container>...]
-./check-java4shell.sh k8s <namespace> <label-selector> [--context <ctx>] [-c <container>]
+./check-java4shell.sh [options] docker <container> [<container>...]
+./check-java4shell.sh [options] k8s <namespace> <label-selector> [--context <ctx>] [-c <container>]
 
 # examples
 ./check-java4shell.sh docker keycloak
 ./check-java4shell.sh k8s identity app=keycloak --context prod
 ./check-java4shell.sh --lang pt docker keycloak     # output in Portuguese
 ```
+
+| Option | Default | |
+| --- | --- | --- |
+| `--lang pt` | `en` | Output in Portuguese (also `J4S_LANG=pt`) |
+| `--timeout N` | `60` | Seconds per container/pod; a target that does not answer is reported as `UNDETERMINED` |
+| `--parallel N` | `8` | Containers/pods checked at the same time; results are printed in input order |
+| `--version` | | Prints the version |
 
 Requirements: `bash` on your machine (3.2+, macOS works), `docker` or `kubectl` with permission to `exec`, and `bash` inside the target container.
 
@@ -34,6 +43,7 @@ Requirements: `bash` on your machine (3.2+, macOS works), `docker` or `kubectl` 
 ```
 ── k8s:identity/keycloak-568c44d9b7-4dkp6
    node:             aks-nodepool1-0000000-vmss000001
+   application:      Keycloak
    JDK:              21.0.12.1+1-LTS (Red Hat, Inc.)
    architecture:     amd64
    AVX-512 VBMI:     no (source: JVM)
@@ -58,7 +68,9 @@ Exit code 2 wins over 3. The script can run as a CI or cron check.
 
 1. Finds the `java` process in the container and its exact binary. Under emulation (Rosetta, QEMU) it uses `argv[0]`, because `/proc/<pid>/exe` points to the emulator.
 2. Rebuilds the process's `UseAVX` and `UseBASE64Intrinsics` flags in the order the JVM applies them: `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, command line, `_JAVA_OPTIONS`.
-3. Runs that same binary with those flags and `-version`, and reads what the JVM reports: `java.runtime.version`, `os.arch`, the CPU features from `-Xlog:os+cpu` (`avx512_vbmi`), and the effective flag values from `-XX:+PrintFlagsFinal`. `/proc/cpuinfo` is only a fallback.
+3. Runs that same binary once, with those flags and `-version`, and reads what the JVM reports: `java.runtime.version`, `os.arch`, the CPU features from `-Xlog:os+cpu` (`avx512_vbmi`), and the effective flag values from `-XX:+PrintFlagsFinal`. `/proc/cpuinfo` is only a fallback. Java 8 does not know `-Xlog`, so it gets a second run without it.
+4. That extra JVM is kept small and quiet: `-Xmx16m -XX:+UseSerialGC -XX:-UsePerfData`. It peaks at about 30 MB inside the target container, runs in about 0.1 s and writes no `hsperfdata` file. None of these flags change the effective `UseAVX` or `UseBASE64Intrinsics` values; this was checked on a real x86-64 node.
+5. When the process command line mentions Keycloak, the verdict and advice are specific to Keycloak; otherwise they are generic.
 
 ## If you are exposed
 
@@ -69,19 +81,21 @@ Exit code 2 wins over 3. The script can run as a CI or cron check.
 ## Tests
 
 ```bash
-./test-unit.sh
+./test-unit.sh          # 52 checks, no Docker needed
+./test-integration.sh   # real JVMs in Docker (pinned Temurin 21.0.5 and 8u432)
 ```
 
-37 unit checks feed the analyzer with synthetic probe output. They cover vendor version strings (Red Hat, Temurin, Corretto, Oracle), Java 8, 11, 17.0.5/17.0.6, 23 and 25 GA, ARM64, x86 with and without VBMI, `avx512_vbmi2` alone, the workaround through `UseBASE64Intrinsics=false` and `UseAVX=2`, collection failures, and the Portuguese output.
+- **Unit:** synthetic probe output for vendor version strings (Red Hat, Temurin, Corretto, Oracle), Java 8, 11, 17.0.5/17.0.6, 23 and 25 GA, ARM64, x86 with and without VBMI, `avx512_vbmi2` alone, the workaround through `UseBASE64Intrinsics=false` and `UseAVX=2`, Keycloak-specific and generic advice, the no-C2 note, Portuguese output; plus the parallel runner: input order, timeout, failed exec, and that 4 targets run at the same time.
+- **Integration:** starts real JVMs and checks that the script finds the process, reads the workaround flag and gives the verdict that matches the host CPU. On an x86-64 host with AVX-512 VBMI, it exercises `EXPOSED` and `MITIGATED (WORKAROUND)` on real hardware.
+- **CI** runs shellcheck, the unit tests on Ubuntu (bash 5) and macOS (bash 3.2), and the integration test on an x86-64 runner. The runner's CPU model and whether it has `avx512vbmi` are printed in the log.
 
-It was also run against real JVMs: Keycloak 26.8.1 on arm64 and amd64 (emulated), with the workaround and with an overridden flag; Temurin 8, 11, 17 and 25; an image without bash; and a Keycloak on AKS.
-
-**Not yet verified end to end:** the `EXPOSED` verdict on real AVX-512 VBMI hardware. It is covered by unit tests, using the feature line format the JVM prints.
+It was also run by hand against Keycloak 26.8.1 on arm64 and amd64 (emulated), with the workaround and with an overridden flag, against an image without bash, and against a Keycloak on AKS.
 
 ## Limits
 
 - Needs `bash` inside the container. Distroless images have none, and the script reports `UNDETERMINED`.
 - Checks the first `java` process in each container.
+- A JVM running without the C2 compiler (`-Xint`, `-XX:TieredStopAtLevel` below 4, `-XX:-UseCompiler`) never uses the intrinsic, but is still reported as `EXPOSED`, with a note. This errs on the safe side.
 - Oracle Java SE 8 Enterprise Performance Pack (8u511-perf) is also affected and is not detected. Regular Java 8 is not affected.
 - It does not check whether your code passes untrusted data to the decoder (condition 4).
 

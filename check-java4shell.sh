@@ -4,19 +4,22 @@
 #
 # Read-only. For each container/pod it:
 #   1. finds the running java process and its exact binary (/proc/<pid>/exe);
-#   2. runs that same binary with "-version", passing along the process's
-#      AVX/Base64 flags (JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, command line,
-#      _JAVA_OPTIONS, in that order), and reads what the JVM ITSELF reports:
-#      version, architecture, CPU features (avx512_vbmi) and the effective
-#      values of UseBASE64Intrinsics and UseAVX;
+#   2. runs that same binary once with "-version" (small heap, no perf data
+#      file), passing along the process's AVX/Base64 flags (JAVA_TOOL_OPTIONS,
+#      JDK_JAVA_OPTIONS, command line, _JAVA_OPTIONS, in that order), and reads
+#      what the JVM ITSELF reports: version, architecture, CPU features
+#      (avx512_vbmi) and the effective values of UseBASE64Intrinsics and UseAVX;
 #   3. decides using the four conditions from the advisories.
 # It does NOT send malformed Base64 or anything else that could crash the JVM.
 #
 # Usage:
-#   ./check-java4shell.sh [--lang pt] docker <container> [<container>...]
-#   ./check-java4shell.sh [--lang pt] k8s <namespace> <selector> [--context <ctx>] [-c <container>]
+#   ./check-java4shell.sh [options] docker <container> [<container>...]
+#   ./check-java4shell.sh [options] k8s <namespace> <selector> [--context <ctx>] [-c <container>]
 #       e.g. ./check-java4shell.sh k8s identity app=keycloak --context prod
-#   Output is in English; --lang pt (or J4S_LANG=pt) prints it in Portuguese.
+# Options:
+#   --lang pt       output in Portuguese (default English; or J4S_LANG=pt)
+#   --timeout N     seconds per container/pod before giving up (default 60)
+#   --parallel N    containers/pods checked at the same time (default 8)
 #
 # Verdicts: EXPOSED | MITIGATED (WORKAROUND) | FIXED | NOT EXPOSED ON THIS NODE |
 #           OUT OF SCOPE | UNDETERMINED
@@ -27,6 +30,8 @@
 # Oracle Java SE 8 "Enterprise Performance Pack" (8u511-perf) is also affected
 # and is not detected here (regular Java 8 is not affected).
 set -uo pipefail
+
+VERSION="1.1.0"
 
 # Fixed versions (Oracle / OpenJDK, 2026-11-17).
 FIX_17="17.0.21.1"; FIX_21="21.0.13.1"; FIX_25="25.0.5.1"; FIX_27="27.0.1.1"
@@ -41,7 +46,12 @@ for d in /proc/[0-9]*; do
 done
 echo "JPID=$JPID"
 FL=()
-pick() { case "$1" in -XX:*UseAVX=*|-XX:[+-]UseBASE64Intrinsics) FL+=("$1");; esac; }
+pick() {
+  case "$1" in
+    -XX:*UseAVX=*|-XX:[+-]UseBASE64Intrinsics) FL+=("$1");;
+    -Xint|-XX:TieredStopAtLevel=[0-3]|-XX:-UseCompiler) echo "NOC2=$1";;
+  esac
+}
 if [ -n "$JPID" ]; then
   mapfile -d '' ARGS < "/proc/$JPID/cmdline"
   # The process's java binary. Under emulation (Rosetta/QEMU) /proc/<pid>/exe points
@@ -56,6 +66,7 @@ if [ -n "$JPID" ]; then
     esac
   fi
   [ -n "$JBIN" ] || JBIN=$(command -v java)
+  for a in "${ARGS[@]}"; do case "$a" in *keycloak*) echo "APP=keycloak"; break;; esac; done
   mapfile -d '' ENVS < "/proc/$JPID/environ" 2>/dev/null
   JTO=""; JJO=""; JUO=""
   for e in "${ENVS[@]}"; do
@@ -66,30 +77,34 @@ if [ -n "$JPID" ]; then
     esac
   done
   # Order in which the JVM applies them: JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, command line, _JAVA_OPTIONS (last one wins).
+  set -f   # options from the environment are split into words, never globbed
   for a in $JTO; do pick "$a"; done
   for a in $JJO; do pick "$a"; done
   for a in "${ARGS[@]:1}"; do pick "$a"; done
   for a in $JUO; do pick "$a"; done
+  set +f
 else
   JBIN=$(command -v java)
 fi
 echo "JBIN=$JBIN"
 printf 'FLAG=%s\n' "${FL[@]}"
 [ -n "$JBIN" ] || exit 0
-run() { env -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS "$JBIN" "${FL[@]}" "$@" -version 2>&1; }
-# 1st run: version, architecture and effective flags (works from Java 8 on).
-run -XX:+PrintFlagsFinal -XshowSettings:properties | while IFS= read -r l; do
+# A small, quiet JVM: 16 MB heap, serial GC, no hsperfdata file in the container's /tmp.
+# None of these change the effective UseAVX / UseBASE64Intrinsics values.
+run() { env -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS \
+  "$JBIN" -Xmx16m -XX:+UseSerialGC -XX:-UsePerfData -Xshare:auto "${FL[@]}" "$@" -version 2>&1; }
+# One run on Java 9+; Java 8 does not know -Xlog, so it gets a second run without it.
+OUT=$(run -XX:+PrintFlagsFinal -XshowSettings:properties -Xlog:os+cpu=info)
+case "$OUT" in *java.runtime.version*) ;; *) OUT=$(run -XX:+PrintFlagsFinal -XshowSettings:properties);; esac
+while IFS= read -r l; do
   case "$l" in
     *java.runtime.version\ =*|*java.vendor\ =*|*os.arch\ =*) echo "PROP=$l";;
+    *"[os,cpu] CPU:"*) echo "JCPU=$l";;
     *" UseAVX "*|*" UseBASE64Intrinsics "*) echo "JFLAG=$l";;
     *"{"*"}"*) ;;
     Error*|*"Unrecognized"*|*"Could not create"*|*"rosetta error"*|*"qemu"*) echo "JERR=$l";;
   esac
-done
-# 2nd run: CPU features as the JVM sees them (Java 9+; on Java 8 it fails silently).
-run -Xlog:os+cpu=info | while IFS= read -r l; do
-  case "$l" in *"[os,cpu] CPU:"*) echo "JCPU=$l";; esac
-done
+done <<<"$OUT"
 while IFS= read -r l; do
   case "$l" in flags*|Features*) echo "FLAGS=$l"; break;; esac
 done < /proc/cpuinfo
@@ -138,7 +153,7 @@ show_verdict() {
 EXPOSED=0; UNKNOWN=0
 analyze() { # $1 = label, $2 = node (or "-"), stdin = probe output
   local label=$1 node=$2 out; out=$(cat)
-  local rt vendor arch jcpu flags b64 avx jerr
+  local rt vendor arch jcpu flags b64 avx jerr app noc2
   rt=$(sed -n 's/^PROP=.*java.runtime.version = //p' <<<"$out" | head -1)
   vendor=$(sed -n 's/^PROP=.*java.vendor = //p' <<<"$out" | head -1)
   arch=$(sed -n 's/^PROP=.*os.arch = //p' <<<"$out" | head -1)
@@ -147,6 +162,8 @@ analyze() { # $1 = label, $2 = node (or "-"), stdin = probe output
   b64=$(sed -n 's/^JFLAG=.* UseBASE64Intrinsics *= *\([a-z]*\).*/\1/p' <<<"$out" | head -1)
   avx=$(sed -n 's/^JFLAG=.* UseAVX *= *\([0-9]*\).*/\1/p' <<<"$out" | head -1)
   jerr=$(sed -n 's/^JERR=//p' <<<"$out" | head -1)
+  app=$(sed -n 's/^APP=//p' <<<"$out" | head -1)
+  noc2=$(sed -n 's/^NOC2=//p' <<<"$out" | tail -1)
 
   # Java 8 reports 1.8.0_412-b08; later versions, 21.0.13.1+2-LTS.
   local num=${rt%%[+-]*} feat
@@ -165,6 +182,7 @@ analyze() { # $1 = label, $2 = node (or "-"), stdin = probe output
 
   echo "── $label"
   [ "$node" != "-" ] && echo "   $(T 'node:           ' 'nó:             ')  $node"
+  [ -n "$app" ] && echo "   $(T 'application:    ' 'aplicação:      ')  Keycloak"
   echo "   JDK:              ${rt:-$(T 'not identified' 'não identificado')} (${vendor:-?})"
   echo "   $(T 'architecture:   ' 'arquitetura:    ')  ${arch:-?}"
   echo "   AVX-512 VBMI:     $vbmi_s ($(T source fonte): $src)"
@@ -191,7 +209,14 @@ analyze() { # $1 = label, $2 = node (or "-"), stdin = probe output
   elif [ -z "$b64" ]; then
     verdict=UNDETERMINED; why=$(T "affected JDK on an affected CPU, but could not read the JVM's effective flags" "JDK afetado em CPU afetada, mas não consegui ler as flags efetivas da JVM")
   else
-    verdict=EXPOSED; why=$(T "affected JDK + CPU with AVX-512 VBMI + intrinsic on. Calif lists Keycloak as exploitable before login" "JDK afetado + CPU com AVX-512 VBMI + intrinsic ligado. A Calif lista o Keycloak como explorável antes do login")
+    verdict=EXPOSED
+    why=$(T "affected JDK + CPU with AVX-512 VBMI + intrinsic on" "JDK afetado + CPU com AVX-512 VBMI + intrinsic ligado")
+    if [ -n "$app" ]; then
+      why="$why. $(T "Calif lists Keycloak as exploitable before login" "A Calif lista o Keycloak como explorável antes do login")"
+    else
+      why="$why. $(T "Check whether untrusted input reaches java.util.Base64 (basic or URL decoder), e.g. HTTP Basic, JWT with auth0 java-jwt, SAML" "Verifique se dados de fora chegam ao java.util.Base64 (decoder básico ou URL), ex.: HTTP Basic, JWT com auth0 java-jwt, SAML")"
+    fi
+    [ -n "$noc2" ] && why="$why. $(T "Note: the JVM runs with $noc2 (no C2 compiler), so the intrinsic is likely never used" "Obs.: a JVM roda com $noc2 (sem o compilador C2), então o intrinsic provavelmente nunca é usado")"
   fi
   if [ "$feat" -gt 17 ] 2>/dev/null; then
     case "$feat:$verdict" in
@@ -203,29 +228,90 @@ analyze() { # $1 = label, $2 = node (or "-"), stdin = probe output
   echo "   $(T 'verdict:        ' 'veredito:       ')  $(show_verdict "$verdict") — $why"
   if [ "$verdict" = EXPOSED ]; then
     echo "   $(T 'what to do:     ' 'o que fazer:    ')  $(T "update to JDK $FIX_17 / $FIX_21 / $FIX_25 / $FIX_27 (or your distribution's build);" "atualize para JDK $FIX_17 / $FIX_21 / $FIX_25 / $FIX_27 (ou o build da sua distribuição);")"
-    echo "                     $(T 'until then, on Keycloak: JAVA_OPTS_APPEND="-XX:-UseBASE64Intrinsics" and restart.' 'até lá, no Keycloak: JAVA_OPTS_APPEND="-XX:-UseBASE64Intrinsics" e reinicie.')"
+    if [ -n "$app" ]; then
+      echo "                     $(T 'until then: JAVA_OPTS_APPEND="-XX:-UseBASE64Intrinsics" and restart Keycloak.' 'até lá: JAVA_OPTS_APPEND="-XX:-UseBASE64Intrinsics" e reinicie o Keycloak.')"
+    else
+      echo "                     $(T 'until then, start the JVM with -XX:-UseBASE64Intrinsics.' 'até lá, suba a JVM com -XX:-UseBASE64Intrinsics.')"
+    fi
   fi
   echo
 }
 
-usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 1; }
+
+# ---- Running the probe on many targets, in parallel and with a timeout ----
+# Jobs are described by kind (docker|k8s), target, label and node; KC/CT/NS are
+# the kubectl prefix, container flag and namespace for k8s jobs.
+TIMEOUT=${J4S_TIMEOUT:-60}; PARALLEL=${J4S_PARALLEL:-8}
+J_KIND=(); J_TARGET=(); J_LABEL=(); J_NODE=(); J_PID=(); J_WD=()
+KC=(kubectl); CT=(); NS=""
+
+exec_target() { # runs in a background subshell; exec makes it the real process, so a timeout can kill it
+  case "$1" in
+    docker) exec docker exec "$2" bash -c "$PROBE";;
+    k8s) exec "${KC[@]}" -n "$NS" exec "$2" ${CT[@]+"${CT[@]}"} -- bash -c "$PROBE";;
+    sh) exec bash -c "$2";;   # used by the tests
+  esac
+}
+start_job() {
+  local i=$1
+  ( exec_target "${J_KIND[i]}" "${J_TARGET[i]}" ) >"$TMPD/$i.out" 2>&1 </dev/null &
+  J_PID[i]=$!
+  ( trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$TIMEOUT" & s=$!; wait "$s"
+    kill -TERM "${J_PID[i]}" 2>/dev/null && : >"$TMPD/$i.timeout" ) &
+  J_WD[i]=$!
+}
+finish_job() {
+  local i=$1 rc
+  wait "${J_PID[i]}"; rc=$?
+  kill "${J_WD[i]}" 2>/dev/null; wait "${J_WD[i]}" 2>/dev/null
+  if [ -e "$TMPD/$i.timeout" ]; then
+    echo "── ${J_LABEL[i]}: $(T "no answer within ${TIMEOUT}s" "sem resposta em ${TIMEOUT}s") — $(show_verdict UNDETERMINED)"; echo; UNKNOWN=1
+  elif [ "$rc" != 0 ]; then
+    echo "── ${J_LABEL[i]}: $(T "exec failed" "falha no exec") — $(show_verdict UNDETERMINED)"
+    head -3 "$TMPD/$i.out" | sed 's/^/   /'; echo; UNKNOWN=1
+  else
+    analyze "${J_LABEL[i]}" "${J_NODE[i]}" <"$TMPD/$i.out"
+  fi
+}
+run_jobs() { # starts up to PARALLEL jobs at a time and prints results in order
+  local n=${#J_KIND[@]} i
+  TMPD=$(mktemp -d); trap 'rm -rf "$TMPD"' EXIT
+  for ((i = 0; i < n; i++)); do
+    ((i >= PARALLEL)) && finish_job $((i - PARALLEL))
+    start_job "$i"
+  done
+  for ((i = (n > PARALLEL ? n - PARALLEL : 0); i < n; i++)); do finish_job "$i"; done
+}
+add_job() { J_KIND+=("$1"); J_TARGET+=("$2"); J_LABEL+=("$3"); J_NODE+=("$4"); }
 
 # Allows "source" from the tests without running anything.
 [ "${CHECK_JAVA4SHELL_LIB:-}" = 1 ] && return 0 2>/dev/null
 
-if [ "${1:-}" = "--lang" ]; then J4S_LANG=${2:-en}; shift 2; fi
+# Global options may appear anywhere.
+ARGV=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --lang) J4S_LANG=${2:-en}; shift 2;;
+    --timeout) TIMEOUT=${2:-}; shift 2;;
+    --parallel) PARALLEL=${2:-}; shift 2;;
+    --version) echo "check-java4shell $VERSION"; exit 0;;
+    -h|--help) usage;;
+    *) ARGV+=("$1"); shift;;
+  esac
+done
+case "$TIMEOUT$PARALLEL" in *[!0-9]*|"") usage;; esac
+((TIMEOUT > 0 && PARALLEL > 0)) || usage
+set -- ${ARGV[@]+"${ARGV[@]}"}
 
 case "${1:-}" in
   docker)
     shift; [ $# -ge 1 ] || usage
-    for c in "$@"; do
-      out=$(docker exec "$c" bash -c "$PROBE" 2>&1) || { echo "── docker:$c: $(T 'docker exec failed' 'falha no docker exec')"; echo "$out" | head -3 | sed 's/^/   /'; echo; UNKNOWN=1; continue; }
-      analyze "docker:$c" "-" <<<"$out"
-    done ;;
+    for c in "$@"; do add_job docker "$c" "docker:$c" -; done ;;
   k8s)
     shift; [ $# -ge 2 ] || usage
-    ns=$1 sel=$2; shift 2
-    KC=(kubectl); CT=()
+    NS=$1 sel=$2; shift 2
     while [ $# -gt 0 ]; do
       case "$1" in
         --context) KC+=(--context "$2"); shift 2;;
@@ -233,16 +319,16 @@ case "${1:-}" in
         *) usage;;
       esac
     done
-    pods=$("${KC[@]}" -n "$ns" get pods -l "$sel" --field-selector=status.phase=Running \
+    pods=$("${KC[@]}" -n "$NS" get pods -l "$sel" --field-selector=status.phase=Running \
       -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}') || exit 1
-    [ -n "$pods" ] || { echo "$(T "no running pod matches $sel in $ns" "nenhum pod em execução com $sel em $ns")"; exit 1; }
+    [ -n "$pods" ] || { echo "$(T "no running pod matches $sel in $NS" "nenhum pod em execução com $sel em $NS")"; exit 1; }
     while read -r pod node; do
-      [ -n "$pod" ] || continue
-      out=$("${KC[@]}" -n "$ns" exec "$pod" ${CT[@]+"${CT[@]}"} -- bash -c "$PROBE" 2>&1 </dev/null) || { echo "── k8s:$ns/$pod: $(T 'exec failed' 'falha no exec')"; echo "$out" | head -3 | sed 's/^/   /'; echo; UNKNOWN=1; continue; }
-      analyze "k8s:$ns/$pod" "$node" <<<"$out"
+      [ -n "$pod" ] && add_job k8s "$pod" "k8s:$NS/$pod" "$node"
     done <<<"$pods" ;;
   *) usage ;;
 esac
+
+run_jobs
 
 ((EXPOSED)) && exit 2
 ((UNKNOWN)) && exit 3
