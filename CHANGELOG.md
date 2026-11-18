@@ -8,7 +8,7 @@
 - Environment options are split into words without glob expansion.
 - A JVM running without C2 gets a note: the intrinsic is likely never used.
 - `--version`, `--help`; global options may appear anywhere.
-- Integration test with real JVMs in Docker, and CI (shellcheck, unit tests on Ubuntu and macOS, integration on x86-64).
+- Integration test with real JVMs in Docker, and CI (shellcheck, unit tests on bash 5.3 and 3.2, integration on x86-64).
 
 ## 1.0.0
 

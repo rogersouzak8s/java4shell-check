@@ -21,16 +21,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            bash: bash        # bash 5
-          - os: macos-latest
-            bash: /bin/bash   # bash 3.2, the one macOS ships
-    runs-on: ${{ matrix.os }}
+        bash: ["5.3", "3.2"]   # 3.2 is the bash macOS ships
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - run: ${{ matrix.bash }} --version | head -1
-      - run: ${{ matrix.bash }} ./test-unit.sh
+      - name: unit tests on bash ${{ matrix.bash }}
+        run: docker run --rm -v "$PWD:/w:ro" -w /w bash:${{ matrix.bash }} bash -c 'bash --version | head -1 && bash ./test-unit.sh'
 
   integration:
     runs-on: ubuntu-latest
