@@ -13,7 +13,7 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: shellcheck (warnings and errors)
         run: shellcheck -S warning -x check-java4shell.sh test-unit.sh test-integration.sh
 
@@ -28,14 +28,14 @@ jobs:
             bash: /bin/bash   # bash 3.2, the one macOS ships
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: ${{ matrix.bash }} --version | head -1
       - run: ${{ matrix.bash }} ./test-unit.sh
 
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: runner CPU
         run: |
           grep -m1 'model name' /proc/cpuinfo
