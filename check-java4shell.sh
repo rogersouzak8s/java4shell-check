@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# check-java4shell.sh — checks, without any intrusive test, whether a Keycloak
+# (or any other Java service) is exposed to CVE-2026-114938 ("Java4Shell").
+#
+# Read-only. For each container/pod it:
+#   1. finds the running java process and its exact binary (/proc/<pid>/exe);
+#   2. runs that same binary with "-version", passing along the process's
+#      AVX/Base64 flags (JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, command line,
+#      _JAVA_OPTIONS, in that order), and reads what the JVM ITSELF reports:
+#      version, architecture, CPU features (avx512_vbmi) and the effective
+#      values of UseBASE64Intrinsics and UseAVX;
+#   3. decides using the four conditions from the advisories.
+# It does NOT send malformed Base64 or anything else that could crash the JVM.
+#
+# Usage:
+#   ./check-java4shell.sh [--lang pt] docker <container> [<container>...]
+#   ./check-java4shell.sh [--lang pt] k8s <namespace> <selector> [--context <ctx>] [-c <container>]
+#       e.g. ./check-java4shell.sh k8s identity app=keycloak --context prod
+#   Output is in English; --lang pt (or J4S_LANG=pt) prints it in Portuguese.
+#
+# Verdicts: EXPOSED | MITIGATED (WORKAROUND) | FIXED | NOT EXPOSED ON THIS NODE |
+#           OUT OF SCOPE | UNDETERMINED
+# Exit code: 0 no exposed/undetermined; 2 at least one exposed;
+#            3 at least one undetermined (and none exposed); 1 usage error.
+#
+# Limits: needs bash inside the container (distroless images have none);
+# Oracle Java SE 8 "Enterprise Performance Pack" (8u511-perf) is also affected
+# and is not detected here (regular Java 8 is not affected).
+set -uo pipefail
+
+# Fixed versions (Oracle / OpenJDK, 2026-11-17).
+FIX_17="17.0.21.1"; FIX_21="21.0.13.1"; FIX_25="25.0.5.1"; FIX_27="27.0.1.1"
+
+# Probe that runs INSIDE the container. Only bash and /proc (works on minimal images).
+read -r -d '' PROBE <<'EOS'
+JPID=""
+for d in /proc/[0-9]*; do
+  [ -r "$d/comm" ] || continue
+  read -r c < "$d/comm" 2>/dev/null || continue
+  if [ "$c" = "java" ]; then JPID="${d#/proc/}"; break; fi
+done
+echo "JPID=$JPID"
+FL=()
+pick() { case "$1" in -XX:*UseAVX=*|-XX:[+-]UseBASE64Intrinsics) FL+=("$1");; esac; }
+if [ -n "$JPID" ]; then
+  mapfile -d '' ARGS < "/proc/$JPID/cmdline"
+  # The process's java binary. Under emulation (Rosetta/QEMU) /proc/<pid>/exe points
+  # to the emulator; in that case use argv[0] from the command line.
+  JBIN=""
+  EXE=$(readlink "/proc/$JPID/exe" 2>/dev/null)
+  case "$EXE" in */java) JBIN="/proc/$JPID/exe";; esac
+  if [ -z "$JBIN" ]; then
+    case "${ARGS[0]}" in
+      */java) [ -x "${ARGS[0]}" ] && JBIN="${ARGS[0]}";;
+      java) JBIN=$(command -v java);;
+    esac
+  fi
+  [ -n "$JBIN" ] || JBIN=$(command -v java)
+  mapfile -d '' ENVS < "/proc/$JPID/environ" 2>/dev/null
+  JTO=""; JJO=""; JUO=""
+  for e in "${ENVS[@]}"; do
+    case "$e" in
+      JAVA_TOOL_OPTIONS=*) JTO="${e#*=}"; echo "ENV=$e";;
+      JDK_JAVA_OPTIONS=*)  JJO="${e#*=}"; echo "ENV=$e";;
+      _JAVA_OPTIONS=*)     JUO="${e#*=}"; echo "ENV=$e";;
+    esac
+  done
+  # Order in which the JVM applies them: JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, command line, _JAVA_OPTIONS (last one wins).
+  for a in $JTO; do pick "$a"; done
+  for a in $JJO; do pick "$a"; done
+  for a in "${ARGS[@]:1}"; do pick "$a"; done
+  for a in $JUO; do pick "$a"; done
+else
+  JBIN=$(command -v java)
+fi
+echo "JBIN=$JBIN"
+printf 'FLAG=%s\n' "${FL[@]}"
+[ -n "$JBIN" ] || exit 0
+run() { env -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS "$JBIN" "${FL[@]}" "$@" -version 2>&1; }
+# 1st run: version, architecture and effective flags (works from Java 8 on).
+run -XX:+PrintFlagsFinal -XshowSettings:properties | while IFS= read -r l; do
+  case "$l" in
+    *java.runtime.version\ =*|*java.vendor\ =*|*os.arch\ =*) echo "PROP=$l";;
+    *" UseAVX "*|*" UseBASE64Intrinsics "*) echo "JFLAG=$l";;
+    *"{"*"}"*) ;;
+    Error*|*"Unrecognized"*|*"Could not create"*|*"rosetta error"*|*"qemu"*) echo "JERR=$l";;
+  esac
+done
+# 2nd run: CPU features as the JVM sees them (Java 9+; on Java 8 it fails silently).
+run -Xlog:os+cpu=info | while IFS= read -r l; do
+  case "$l" in *"[os,cpu] CPU:"*) echo "JCPU=$l";; esac
+done
+while IFS= read -r l; do
+  case "$l" in flags*|Features*) echo "FLAGS=$l"; break;; esac
+done < /proc/cpuinfo
+EOS
+
+ver_ge() { # ver_ge A B → true if A >= B (numeric, part by part)
+  local a b i x y
+  IFS=. read -r -a a <<<"$1"
+  IFS=. read -r -a b <<<"$2"
+  for i in 0 1 2 3; do
+    x=${a[i]:-0}; y=${b[i]:-0}
+    x=${x//[^0-9]/}; y=${y//[^0-9]/}
+    ((10#${x:-0} > 10#${y:-0})) && return 0
+    ((10#${x:-0} < 10#${y:-0})) && return 1
+  done
+  return 0
+}
+
+# is_fixed <numeric version> → true if it is the fixed release of its line or later
+is_fixed() {
+  local num=$1 feat=${1%%.*}
+  case "$feat" in
+    17) ver_ge "$num" "$FIX_17";;
+    21) ver_ge "$num" "$FIX_21";;
+    25) ver_ge "$num" "$FIX_25";;
+    27) ver_ge "$num" "$FIX_27";;
+    *) return 1;;
+  esac
+}
+
+# Output language: English by default, Portuguese with --lang pt or J4S_LANG=pt.
+J4S_LANG=${J4S_LANG:-en}
+T() { if [ "$J4S_LANG" = pt ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+# Verdict codes are English; this maps them for display.
+show_verdict() {
+  case "$1" in
+    EXPOSED) T "EXPOSED" "EXPOSTO";;
+    MITIGATED) T "MITIGATED (WORKAROUND)" "MITIGADO (WORKAROUND)";;
+    FIXED) T "FIXED" "CORRIGIDO";;
+    NOT_EXPOSED) T "NOT EXPOSED ON THIS NODE" "NÃO EXPOSTO NESTE NÓ";;
+    OUT_OF_SCOPE) T "OUT OF SCOPE" "FORA DO ESCOPO";;
+    *) T "UNDETERMINED" "INDETERMINADO";;
+  esac
+}
+
+EXPOSED=0; UNKNOWN=0
+analyze() { # $1 = label, $2 = node (or "-"), stdin = probe output
+  local label=$1 node=$2 out; out=$(cat)
+  local rt vendor arch jcpu flags b64 avx jerr
+  rt=$(sed -n 's/^PROP=.*java.runtime.version = //p' <<<"$out" | head -1)
+  vendor=$(sed -n 's/^PROP=.*java.vendor = //p' <<<"$out" | head -1)
+  arch=$(sed -n 's/^PROP=.*os.arch = //p' <<<"$out" | head -1)
+  jcpu=$(sed -n 's/^JCPU=//p' <<<"$out" | head -1)
+  flags=$(sed -n 's/^FLAGS=//p' <<<"$out" | head -1)
+  b64=$(sed -n 's/^JFLAG=.* UseBASE64Intrinsics *= *\([a-z]*\).*/\1/p' <<<"$out" | head -1)
+  avx=$(sed -n 's/^JFLAG=.* UseAVX *= *\([0-9]*\).*/\1/p' <<<"$out" | head -1)
+  jerr=$(sed -n 's/^JERR=//p' <<<"$out" | head -1)
+
+  # Java 8 reports 1.8.0_412-b08; later versions, 21.0.13.1+2-LTS.
+  local num=${rt%%[+-]*} feat
+  feat=${num%%.*}; [ "$feat" = 1 ] && feat=8
+
+  # VBMI: from the JVM (named avx512_vbmi), with /proc/cpuinfo as fallback.
+  local vbmi="?" src="JVM"
+  if [ -n "$jcpu" ]; then
+    if grep -Eq '(^|[ ,])avx512_?vbmi([ ,]|$)' <<<"$jcpu"; then vbmi=yes; else vbmi=no; fi
+  elif [ -n "$flags" ]; then
+    src="/proc/cpuinfo"
+    if grep -Eq '(^|[ ,])avx512_?vbmi([ ,]|$)' <<<"$flags"; then vbmi=yes; else vbmi=no; fi
+  fi
+  local vbmi_s=$vbmi
+  [ "$vbmi" = yes ] && vbmi_s=$(T yes sim); [ "$vbmi" = no ] && vbmi_s=$(T no não)
+
+  echo "── $label"
+  [ "$node" != "-" ] && echo "   $(T 'node:           ' 'nó:             ')  $node"
+  echo "   JDK:              ${rt:-$(T 'not identified' 'não identificado')} (${vendor:-?})"
+  echo "   $(T 'architecture:   ' 'arquitetura:    ')  ${arch:-?}"
+  echo "   AVX-512 VBMI:     $vbmi_s ($(T source fonte): $src)"
+  echo "   $(T 'effective flags:' 'flags efetivas: ')  UseAVX=${avx:-n/a}  UseBASE64Intrinsics=${b64:-n/a}"
+  [ -n "$jerr" ] && echo "   $(T 'JVM warning:    ' 'aviso da JVM:   ')  $jerr"
+
+  local verdict why
+  if [ -z "$rt" ]; then
+    verdict=UNDETERMINED; why=$(T "could not read the JDK version (no running java, or no bash in the image)" "não consegui ler a versão do JDK (sem java em execução ou sem bash na imagem)")
+  elif [ "$feat" -lt 17 ] 2>/dev/null; then
+    verdict=OUT_OF_SCOPE; why=$(T "Java $feat does not have the affected intrinsic" "Java $feat não tem o intrinsic afetado")
+  elif [ "$feat" = 17 ] && ! ver_ge "$num" "17.0.6"; then
+    verdict=OUT_OF_SCOPE; why=$(T "Java 17 older than 17.0.6" "Java 17 anterior ao 17.0.6")
+  elif is_fixed "$num"; then
+    verdict=FIXED; why=$(T "fixed release of the $feat line or later" "versão igual ou posterior à corrigida da linha $feat")
+  elif [ "$arch" != "amd64" ] && [ "$arch" != "x86_64" ]; then
+    verdict=OUT_OF_SCOPE; why=$(T "architecture $arch (only x86-64 has the vulnerable code path)" "arquitetura $arch (só x86-64 tem o caminho vulnerável)")
+  elif [ "$vbmi" = "?" ]; then
+    verdict=UNDETERMINED; why=$(T "could not read the CPU features" "não consegui ler as features da CPU")
+  elif [ "$vbmi" = no ]; then
+    verdict=NOT_EXPOSED; why=$(T "affected JDK, but the CPU has no AVX-512 VBMI; check again if the pod moves to another node or machine type" "JDK afetado, mas a CPU não tem AVX-512 VBMI; reavalie se o pod mudar de nó ou de tipo de máquina")
+  elif [ "$b64" = "false" ] || { [ -n "$avx" ] && [ "$avx" -lt 3 ]; }; then
+    verdict=MITIGATED; why=$(T "affected JDK on an affected CPU, but the JVM runs with the intrinsic/AVX-512 turned off; update and then remove the flag" "JDK afetado em CPU afetada, mas a JVM roda com o intrinsic/AVX-512 desligado; atualize e remova a flag")
+  elif [ -z "$b64" ]; then
+    verdict=UNDETERMINED; why=$(T "affected JDK on an affected CPU, but could not read the JVM's effective flags" "JDK afetado em CPU afetada, mas não consegui ler as flags efetivas da JVM")
+  else
+    verdict=EXPOSED; why=$(T "affected JDK + CPU with AVX-512 VBMI + intrinsic on. Calif lists Keycloak as exploitable before login" "JDK afetado + CPU com AVX-512 VBMI + intrinsic ligado. A Calif lista o Keycloak como explorável antes do login")
+  fi
+  if [ "$feat" -gt 17 ] 2>/dev/null; then
+    case "$feat:$verdict" in
+      21:*|25:*|27:*|*:OUT_OF_SCOPE|*:FIXED) ;;
+      *) why="$why. $(T "Java $feat is not LTS and will get no fix: move to 21, 25 or 27" "Java $feat não é LTS e não terá correção: migre para 21, 25 ou 27")";;
+    esac
+  fi
+  case "$verdict" in EXPOSED) EXPOSED=1;; UNDETERMINED) UNKNOWN=1;; esac
+  echo "   $(T 'verdict:        ' 'veredito:       ')  $(show_verdict "$verdict") — $why"
+  if [ "$verdict" = EXPOSED ]; then
+    echo "   $(T 'what to do:     ' 'o que fazer:    ')  $(T "update to JDK $FIX_17 / $FIX_21 / $FIX_25 / $FIX_27 (or your distribution's build);" "atualize para JDK $FIX_17 / $FIX_21 / $FIX_25 / $FIX_27 (ou o build da sua distribuição);")"
+    echo "                     $(T 'until then, on Keycloak: JAVA_OPTS_APPEND="-XX:-UseBASE64Intrinsics" and restart.' 'até lá, no Keycloak: JAVA_OPTS_APPEND="-XX:-UseBASE64Intrinsics" e reinicie.')"
+  fi
+  echo
+}
+
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+# Allows "source" from the tests without running anything.
+[ "${CHECK_JAVA4SHELL_LIB:-}" = 1 ] && return 0 2>/dev/null
+
+if [ "${1:-}" = "--lang" ]; then J4S_LANG=${2:-en}; shift 2; fi
+
+case "${1:-}" in
+  docker)
+    shift; [ $# -ge 1 ] || usage
+    for c in "$@"; do
+      out=$(docker exec "$c" bash -c "$PROBE" 2>&1) || { echo "── docker:$c: $(T 'docker exec failed' 'falha no docker exec')"; echo "$out" | head -3 | sed 's/^/   /'; echo; UNKNOWN=1; continue; }
+      analyze "docker:$c" "-" <<<"$out"
+    done ;;
+  k8s)
+    shift; [ $# -ge 2 ] || usage
+    ns=$1 sel=$2; shift 2
+    KC=(kubectl); CT=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --context) KC+=(--context "$2"); shift 2;;
+        -c) CT=(-c "$2"); shift 2;;
+        *) usage;;
+      esac
+    done
+    pods=$("${KC[@]}" -n "$ns" get pods -l "$sel" --field-selector=status.phase=Running \
+      -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}') || exit 1
+    [ -n "$pods" ] || { echo "$(T "no running pod matches $sel in $ns" "nenhum pod em execução com $sel em $ns")"; exit 1; }
+    while read -r pod node; do
+      [ -n "$pod" ] || continue
+      out=$("${KC[@]}" -n "$ns" exec "$pod" ${CT[@]+"${CT[@]}"} -- bash -c "$PROBE" 2>&1 </dev/null) || { echo "── k8s:$ns/$pod: $(T 'exec failed' 'falha no exec')"; echo "$out" | head -3 | sed 's/^/   /'; echo; UNKNOWN=1; continue; }
+      analyze "k8s:$ns/$pod" "$node" <<<"$out"
+    done <<<"$pods" ;;
+  *) usage ;;
+esac
+
+((EXPOSED)) && exit 2
+((UNKNOWN)) && exit 3
+exit 0
